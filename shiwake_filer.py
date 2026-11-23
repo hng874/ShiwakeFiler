@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ShiwakeFiler（シワケファイラー） v1.0 — 動画プレビュー付き2ペインファイラー
+ShiwakeFiler（シワケファイラー） v1.2 — 動画・画像・PSD・PDFプレビュー付き2ペインファイラー
   [ペインA] [ペインB] [プレビュー]   ※アクティブなペインの選択がプレビューされる
 
   移動
@@ -13,9 +13,10 @@ ShiwakeFiler（シワケファイラー） v1.0 — 動画プレビュー付き2
     K : フォルダ作成        D / Delete : ごみ箱へ
     L : ドライブ変更        R / F2 : リネーム
     O : 反対ペインを同じフォルダにする
+  一覧の先頭には常に「デスクトップ」へのショートカット
   プレビュー
-    P : 再生/一時停止    Ctrl+← → : 5秒移動（Ctrl+Shift で1秒）
-必要: pip install PySide6 av send2trash
+    P : 再生/一時停止    Ctrl+← → : 5秒移動（Ctrl+Shift で1秒）／PDFはページ送り
+必要: pip install PySide6 av send2trash pillow
 """
 import os
 import shutil
@@ -24,17 +25,20 @@ import time
 from pathlib import Path
 
 import av
-from PySide6.QtCore import (Qt, QUrl, QThread, Signal, QSize, QEvent, QSettings, QDir, QPoint)
-from PySide6.QtGui import (QImage, QPixmap, QIcon, QShortcut, QKeySequence, QColor, QBrush, QFont)
+from PySide6.QtCore import (Qt, QUrl, QThread, Signal, QSize, QEvent, QSettings, QDir, QPoint,
+                            QStandardPaths, QTimer)
+from PySide6.QtGui import (QImage, QPixmap, QIcon, QShortcut, QKeySequence, QColor, QBrush, QFont,
+                           QImageReader, QImageIOHandler, QMovie)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem, QSplitter,
     QVBoxLayout, QHBoxLayout, QSlider, QLabel, QLineEdit, QPushButton,
     QFileDialog, QMessageBox, QCheckBox, QListView, QAbstractItemView,
     QTreeWidget, QTreeWidgetItem, QFileIconProvider, QStyle, QToolButton, QHeaderView,
-    QInputDialog, QMenu, QProgressDialog, QStyleOptionSlider,
+    QInputDialog, QMenu, QProgressDialog, QStyleOptionSlider, QStackedWidget,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtPdf import QPdfDocument
 
 try:
     from send2trash import send2trash
@@ -43,6 +47,10 @@ except ImportError:
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".mpg", ".mpeg",
               ".ts", ".m2ts", ".mts", ".webm", ".flv", ".3gp", ".vob"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+              ".ico", ".jfif", ".tga", ".svg", ".psd"}
+PDF_EXTS = {".pdf"}
+PDF_THUMB_H = 90
 THUMB_COUNT = 12
 THUMB_W = 160
 PLAY_KEY = Qt.Key_P          # 再生/一時停止キー（好みで変更可）
@@ -244,7 +252,13 @@ class FileOpWorker(QThread):
 
 
 # ファイラーの行種別
-K_UP, K_DRIVE, K_DIR, K_VIDEO, K_FILE = range(5)
+K_UP, K_DRIVE, K_DIR, K_VIDEO, K_FILE, K_IMAGE, K_DESK, K_PDF = range(8)
+NAV_KINDS = (K_UP, K_DESK)   # 移動用の特別な行
+
+
+def _group(kind):
+    """並び順のグループ：デスクトップ → .. → フォルダ → ファイル"""
+    return {K_DESK: -1, K_UP: 0, K_DRIVE: 1, K_DIR: 1}.get(kind, 2)
 
 
 class FileItem(QTreeWidgetItem):
@@ -255,19 +269,19 @@ class FileItem(QTreeWidgetItem):
         self.kind, self.path, self.name = kind, path, name
         self.size, self.mtime = size, mtime
         self.marked = False
-        self.ext = "" if kind in (K_UP, K_DRIVE, K_DIR) else Path(name).suffix.lower()
+        self.ext = "" if kind in (K_UP, K_DRIVE, K_DIR, K_DESK) else Path(name).suffix.lower()
         self.setText(0, name)
-        if size >= 0 and kind in (K_VIDEO, K_FILE):
+        if size >= 0 and kind in (K_VIDEO, K_FILE, K_IMAGE, K_PDF):
             self.setText(1, fmt_size(size))
             self.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
         if mtime:
             self.setText(2, time.strftime("%Y/%m/%d %H:%M", time.localtime(mtime)))
-        self.setText(3, {K_UP: "", K_DRIVE: "ドライブ", K_DIR: "フォルダ"}.get(
+        self.setText(3, {K_UP: "", K_DRIVE: "ドライブ", K_DIR: "フォルダ", K_DESK: "ショートカット"}.get(
             kind, self.ext[1:].upper() if self.ext else "ファイル"))
 
     @property
     def markable(self):
-        return self.kind in (K_DIR, K_VIDEO, K_FILE)
+        return self.kind in (K_DIR, K_VIDEO, K_FILE, K_IMAGE, K_PDF)
 
     def set_marked(self, on: bool):
         self.marked = on and self.markable
@@ -281,8 +295,7 @@ class FileItem(QTreeWidgetItem):
     def __lt__(self, other):
         tw = self.treeWidget()
         desc = tw is not None and tw.header().sortIndicatorOrder() == Qt.DescendingOrder
-        ga = 0 if self.kind == K_UP else 1 if self.kind in (K_DRIVE, K_DIR) else 2
-        gb = 0 if other.kind == K_UP else 1 if other.kind in (K_DRIVE, K_DIR) else 2
+        ga, gb = _group(self.kind), _group(other.kind)
         if ga != gb:
             return (ga < gb) != desc
         col = tw.sortColumn() if tw else 0
@@ -387,7 +400,7 @@ class FilePane(QWidget):
             if str(it.path) not in gone:
                 return it.name
         for it in reversed(rows[:i]):
-            if str(it.path) not in gone and it.kind != K_UP:
+            if str(it.path) not in gone and it.kind not in NAV_KINDS:
                 return it.name
         return None
 
@@ -421,12 +434,13 @@ class FilePane(QWidget):
         self.update_count()
 
     def update_count(self):
-        n_dir = n_vid = n_file = 0
+        n_dir = n_vid = n_img = n_file = 0
         for it in self.items():
             n_dir += it.kind in (K_DIR, K_DRIVE)
             n_vid += it.kind == K_VIDEO
+            n_img += it.kind in (K_IMAGE, K_PDF)
             n_file += it.kind == K_FILE
-        s = f"フォルダ {n_dir}  動画 {n_vid}  その他 {n_file}"
+        s = f"フォルダ {n_dir}  動画 {n_vid}  画像・PDF {n_img}  その他 {n_file}"
         m = [it for it in self.items() if it.marked]
         if m:
             sz = sum(max(0, it.size) for it in m)
@@ -500,6 +514,11 @@ class FilePane(QWidget):
         tree.setSortingEnabled(False)
         tree.clear()
         items = []
+        desk = w.desktop_path()
+        if desk is not None:
+            it = FileItem(K_DESK, desk, "デスクトップ")
+            it.setIcon(0, w.ic_desk)
+            items.append(it)
         if folder is None:
             self.addr.setText("")
             for d in QDir.drives():
@@ -513,7 +532,7 @@ class FilePane(QWidget):
             up = FileItem(K_UP, folder.parent if folder.parent != folder else None, "..")
             up.setIcon(0, w.ic_up)
             items.append(up)
-            video_only = w.chk_video_only.isChecked()
+            media_only = w.chk_video_only.isChecked()
             show_hidden = w.chk_hidden.isChecked()
             try:
                 with os.scandir(folder) as sd:
@@ -529,12 +548,14 @@ class FilePane(QWidget):
                             it = FileItem(K_DIR, Path(e.path), e.name, mtime=stt.st_mtime)
                             it.setIcon(0, w.ic_dir)
                         else:
-                            is_vid = Path(e.name).suffix.lower() in VIDEO_EXTS
-                            if video_only and not is_vid:
+                            ext = Path(e.name).suffix.lower()
+                            kind = (K_VIDEO if ext in VIDEO_EXTS else K_IMAGE if ext in IMAGE_EXTS
+                                    else K_PDF if ext in PDF_EXTS else K_FILE)
+                            if media_only and kind == K_FILE:
                                 continue
-                            it = FileItem(K_VIDEO if is_vid else K_FILE, Path(e.path), e.name,
-                                          stt.st_size, stt.st_mtime)
-                            it.setIcon(0, w.ic_video if is_vid else w.ic_file)
+                            it = FileItem(kind, Path(e.path), e.name, stt.st_size, stt.st_mtime)
+                            it.setIcon(0, {K_VIDEO: w.ic_video, K_IMAGE: w.ic_image,
+                                           K_PDF: w.ic_pdf}.get(kind, w.ic_file))
                         if e.name in self.marks:
                             it.set_marked(True)
                         items.append(it)
@@ -545,7 +566,9 @@ class FilePane(QWidget):
         self.marks = {it.name for it in items if it.marked}
         target = self.find(select_name) if select_name else None
         if target is None and items:
-            target = tree.topLevelItem(1 if folder is not None and len(items) > 1 else 0)
+            # 「デスクトップ」「..」ではなく最初の中身を選ぶ
+            rows = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+            target = next((r for r in rows if r.kind not in NAV_KINDS), rows[0])
         if target is not None:
             tree.setCurrentItem(target)
             tree.scrollToItem(target)
@@ -561,6 +584,130 @@ def _is_hidden(entry) -> bool:
         return bool(entry.stat().st_file_attributes & 2)  # Windows FILE_ATTRIBUTE_HIDDEN
     except (AttributeError, OSError):
         return False
+
+
+class PsdWorker(QThread):
+    """PSDの統合画像をPillowで読む（重いので別スレッド）"""
+    loaded = Signal(int, QImage, int, int)   # gen, 画像, 元の幅, 元の高さ
+    failed = Signal(int, str)
+
+    def __init__(self, gen, path: str, box: QSize):
+        super().__init__()
+        self.gen, self.path, self.box = gen, path, box
+
+    def run(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.failed.emit(self.gen, "PSDの表示には pip install pillow が必要です")
+            return
+        try:
+            with Image.open(self.path) as im:
+                w, h = im.size
+                im.load()
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+                if im.width > self.box.width() or im.height > self.box.height():
+                    im.thumbnail((max(1, self.box.width()), max(1, self.box.height())))
+                im = im.convert("RGBA")
+                data = im.tobytes("raw", "RGBA")
+                img = QImage(data, im.width, im.height, im.width * 4, QImage.Format_RGBA8888).copy()
+            self.loaded.emit(self.gen, img, w, h)
+        except Exception as e:
+            self.failed.emit(self.gen, f"このPSDは表示できません（{e}）")
+
+
+class ImageView(QLabel):
+    """静止画プレビュー（縦横比を保って枠に収める／GIFはアニメ再生）"""
+
+    def __init__(self):
+        super().__init__()
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(400, 225)
+        self.setStyleSheet("background:#111; color:#888;")
+        self._pix = None
+        self._movie = None
+        self._full = None   # 元画像サイズ
+
+    def clear_image(self):
+        if self._movie:
+            self._movie.stop()
+            self.setMovie(None)
+            self._movie.deleteLater()
+            self._movie = None
+        self._pix = None
+        self.clear()
+
+    def load(self, path: Path):
+        """表示して (幅, 高さ) を返す。失敗なら None"""
+        self.clear_image()
+        p = str(path)
+        if path.suffix.lower() == ".gif":
+            mv = QMovie(p)
+            if mv.isValid() and mv.frameCount() > 1:
+                self._movie = mv
+                mv.jumpToFrame(0)
+                self._full = mv.currentImage().size()
+                self.setMovie(mv)
+                self._fit_movie()
+                mv.start()
+                return self._full.width(), self._full.height()
+            mv.deleteLater()
+        r = QImageReader(p)
+        r.setAutoTransform(True)          # EXIFの回転を反映
+        size = r.size()
+        if size.isValid():
+            # 枠より大きければ縮小しながら読む（大きな写真でも軽い）
+            box = self.size() * self.devicePixelRatioF() * 1.5
+            rot = bool(r.transformation() & QImageIOHandler.Transformation.TransformationRotate90)
+            src = size.transposed() if rot else size
+            if src.width() > box.width() or src.height() > box.height():
+                fit = src.scaled(box, Qt.KeepAspectRatio)
+                r.setScaledSize(fit.transposed() if rot else fit)
+            self._full = src
+        img = r.read()
+        if img.isNull():
+            self.setText("この画像は表示できません")
+            return None
+        if not size.isValid():
+            self._full = img.size()
+        self._pix = QPixmap.fromImage(img)
+        self._fit()
+        return self._full.width(), self._full.height()
+
+    def set_image(self, img: QImage, full=None):
+        self.clear_image()
+        self._full = full or img.size()
+        self._pix = QPixmap.fromImage(img)
+        self._fit()
+
+    def set_message(self, text: str):
+        self.clear_image()
+        self.setText(text)
+
+    def _fit(self):
+        if self._pix is None:
+            return
+        dpr = self.devicePixelRatioF()
+        target = self.size() * dpr
+        pm = self._pix
+        if pm.width() > target.width() or pm.height() > target.height():
+            pm = pm.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm.setDevicePixelRatio(dpr)
+        self.setPixmap(pm)
+
+    def _fit_movie(self):
+        if self._movie and self._full:
+            s = self._full
+            if s.width() > self.width() or s.height() > self.height():
+                s = s.scaled(self.size(), Qt.KeepAspectRatio)
+            self._movie.setScaledSize(s)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._movie:
+            self._fit_movie()
+        else:
+            self._fit()
 
 
 class MainWindow(QMainWindow):
@@ -584,6 +731,13 @@ class MainWindow(QMainWindow):
         self.ic_file = prov.icon(QFileIconProvider.File)
         self.ic_video = st.standardIcon(QStyle.SP_MediaPlay)
         self.ic_up = st.standardIcon(QStyle.SP_FileDialogToParent)
+        self.ic_desk = st.standardIcon(QStyle.SP_DesktopIcon)
+        self.ic_image = st.standardIcon(QStyle.SP_FileDialogContentsView)
+        self.ic_pdf = st.standardIcon(QStyle.SP_FileDialogDetailedView)
+        self.pdf = QPdfDocument(self)
+        self.pdf_page = 0
+        self.psd_worker = None
+        self._desktop = None
 
         # --- プレイヤー
         self.player = QMediaPlayer(self)
@@ -593,9 +747,13 @@ class MainWindow(QMainWindow):
         self.video = QVideoWidget()
         self.video.setMinimumSize(400, 225)
         self.player.setVideoOutput(self.video)
+        self.image_view = ImageView()
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.video)
+        self.stack.addWidget(self.image_view)
 
         # --- 上部オプション
-        self.chk_video_only = QCheckBox("動画のみ")
+        self.chk_video_only = QCheckBox("対応ファイルのみ")
         self.chk_hidden = QCheckBox("隠しファイル")
         self.chk_auto = QCheckBox("選択で自動再生")
         self.chk_auto.setChecked(True)
@@ -665,8 +823,11 @@ class MainWindow(QMainWindow):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(2, 2, 2, 2)
-        rv.addWidget(self.video, 1)
-        rv.addLayout(seek)
+        rv.addWidget(self.stack, 1)
+        self.seek_w = QWidget()
+        seek.setContentsMargins(0, 0, 0, 0)
+        self.seek_w.setLayout(seek)
+        rv.addWidget(self.seek_w)
         rv.addWidget(self.thumbs)
         rv.addLayout(ren)
         rv.addWidget(self.lbl_info)
@@ -719,12 +880,18 @@ class MainWindow(QMainWindow):
         for p in self.panes:
             p.reload()
 
+    def desktop_path(self):
+        if self._desktop is None:
+            d = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+            self._desktop = Path(d) if d and Path(d).is_dir() else False
+        return self._desktop or None
+
     def on_activate(self, pane, item):
         if item is None:
             return
         if item.kind == K_UP:
             pane.go_up()
-        elif item.kind in (K_DIR, K_DRIVE):
+        elif item.kind in (K_DIR, K_DRIVE, K_DESK):
             pane.navigate(item.path)
         else:
             self.focus_rename()
@@ -758,15 +925,103 @@ class MainWindow(QMainWindow):
     # ================= 選択・再生 =================
     def clear_preview(self):
         self.stop_worker()
+        self.stop_psd()
         self.gen += 1
         self.player.stop()
         self.player.setSource(QUrl())
+        self.pdf.close()
         self.thumbs.clear()
         self.slider.setRange(0, 0)
         self.lbl_time.setText("00:00 / 00:00")
+        self.image_view.clear_image()
+        self.show_video_ui(True)
+
+    def show_video_ui(self, video: bool, strip: bool | None = None):
+        self.stack.setCurrentWidget(self.video if video else self.image_view)
+        self.seek_w.setVisible(video)
+        self.thumbs.setVisible(video if strip is None else strip)
+
+    def preview_box(self) -> QSize:
+        """プレビュー枠の実ピクセル×1.5（拡大しても粗くならない程度）"""
+        s = self.image_view.size() * self.image_view.devicePixelRatioF() * 1.5
+        return QSize(max(400, s.width()), max(300, s.height()))
+
+    # ---------- PSD
+    def stop_psd(self):
+        if self.psd_worker is not None:
+            self.psd_worker.wait()      # 読み込み中のファイルを離すまで待つ
+            self.psd_worker = None
+
+    def show_psd(self, path: Path, size: int):
+        self.image_view.set_message("PSD 読み込み中…")
+        gen = self.gen
+        w = PsdWorker(gen, str(path), self.preview_box())
+
+        def ok(g, img, fw, fh):
+            if g == self.gen:
+                self.image_view.set_image(img, QSize(fw, fh))
+                self.lbl_info.setText(f"{fw}×{fh}   {fmt_size(size)}   {path}")
+
+        def ng(g, msg):
+            if g == self.gen:
+                self.image_view.set_message(msg)
+        w.loaded.connect(ok)
+        w.failed.connect(ng)
+        self.psd_worker = w
+        w.start()
+
+    # ---------- PDF
+    def show_pdf(self, path: Path, size: int):
+        self.pdf.load(str(path))
+        n = self.pdf.pageCount()
+        if self.pdf.status() != QPdfDocument.Status.Ready or n <= 0:
+            self.image_view.set_message("このPDFは表示できません（パスワード付き・破損など）")
+            return
+        self.pdf_info = f"{fmt_size(size)}   {path}"
+        self.thumbs.setIconSize(QSize(PDF_THUMB_H, PDF_THUMB_H))
+        for i in range(n):
+            it = QListWidgetItem(f"p.{i + 1}")
+            it.setData(Qt.UserRole, i)
+            it.setSizeHint(QSize(PDF_THUMB_H + 10, PDF_THUMB_H + 30))
+            self.thumbs.addItem(it)
+        self.show_pdf_page(0)
+        self._pdf_thumb_step(self.gen, 0)
+
+    def show_pdf_page(self, i: int):
+        n = self.pdf.pageCount()
+        if n <= 0:
+            return
+        i = max(0, min(i, n - 1))
+        self.pdf_page = i
+        ps = self.pdf.pagePointSize(i)
+        box = self.preview_box()
+        sz = QSize(max(1, int(ps.width())), max(1, int(ps.height()))).scaled(box, Qt.KeepAspectRatio)
+        img = self.pdf.render(i, sz)
+        self.image_view.set_image(img, sz)
+        self.lbl_info.setText(f"p.{i + 1} / {n}   {self.pdf_info}")
+        self.thumbs.blockSignals(True)
+        self.thumbs.setCurrentRow(i)
+        self.thumbs.scrollToItem(self.thumbs.item(i))
+        self.thumbs.blockSignals(False)
+
+    def _pdf_thumb_step(self, gen: int, i: int):
+        """ページの縮小画像を1枚ずつ作る（操作を止めないように少しずつ）"""
+        if gen != self.gen or i >= self.pdf.pageCount():
+            return
+        ps = self.pdf.pagePointSize(i)
+        dpr = self.thumbs.devicePixelRatioF()
+        box = QSize(int(PDF_THUMB_H * dpr), int(PDF_THUMB_H * dpr))
+        sz = QSize(max(1, int(ps.width())), max(1, int(ps.height()))).scaled(box, Qt.KeepAspectRatio)
+        img = self.pdf.render(i, sz)
+        it = self.thumbs.item(i)
+        if it is not None and not img.isNull():
+            pm = QPixmap.fromImage(img)
+            pm.setDevicePixelRatio(dpr)
+            it.setIcon(QIcon(pm))
+        QTimer.singleShot(0, lambda: self._pdf_thumb_step(gen, i + 1))
 
     def on_select(self, item):
-        if item is None or item.kind in (K_UP, K_DRIVE):
+        if item is None or item.kind in (K_UP, K_DRIVE, K_DESK):
             self.current = None
             self.current_kind = item.kind if item is not None else None
             self.clear_preview()
@@ -795,14 +1050,34 @@ class MainWindow(QMainWindow):
             else:
                 self.player.pause()
             self.start_thumbs(path)
+        elif item.kind == K_PDF:
+            self.clear_preview()
+            self.show_video_ui(False, strip=True)
+            self.show_pdf(path, item.size)
+        elif item.kind == K_IMAGE and path.suffix.lower() == ".psd":
+            self.clear_preview()
+            self.show_video_ui(False)
+            self.show_psd(path, item.size)
+        elif item.kind == K_IMAGE:
+            self.clear_preview()
+            self.show_video_ui(False)
+            wh = self.image_view.load(path)
+            if wh:
+                self.lbl_info.setText(f"{wh[0]}×{wh[1]}   {fmt_size(item.size)}   {path}")
+            else:
+                self.lbl_info.setText(f"（表示できない画像）   {fmt_size(item.size)}   {path}")
         else:
             self.clear_preview()
 
     def release_file(self):
         """リネーム・移動・削除前にファイルを掴んでいるものを全部離す"""
         self.stop_worker()
+        self.stop_psd()
+        self.gen += 1
         self.player.stop()
         self.player.setSource(QUrl())
+        self.pdf.close()
+        self.image_view.clear_image()
         self.current = None
         QApplication.processEvents()
 
@@ -815,6 +1090,9 @@ class MainWindow(QMainWindow):
             self.player.play()
 
     def seek_rel(self, ms: int):
+        if self.current_kind == K_PDF:
+            self.show_pdf_page(self.pdf_page + (1 if ms > 0 else -1))
+            return
         if self.current_kind != K_VIDEO:
             return
         dur = self.player.duration()
@@ -828,6 +1106,8 @@ class MainWindow(QMainWindow):
         if not self.slider.isSliderDown():
             self.slider.setValue(pos)
         self.lbl_time.setText(f"{fmt_time(pos)} / {fmt_time(self.player.duration())}")
+        if self.current_kind != K_VIDEO:
+            return
         # 現在位置に対応するサムネイルをハイライト
         best = -1
         for i in range(self.thumbs.count()):
@@ -851,6 +1131,7 @@ class MainWindow(QMainWindow):
         self.stop_worker()
         self.gen += 1
         self.thumbs.clear()
+        self.thumbs.setIconSize(QSize(THUMB_W, int(THUMB_W * 9 / 16)))
         for i in range(THUMB_COUNT):
             it = QListWidgetItem("…")
             it.setSizeHint(QSize(THUMB_W + 8, int(THUMB_W * 9 / 16) + 30))
@@ -880,6 +1161,9 @@ class MainWindow(QMainWindow):
             it.setData(Qt.UserRole, sec)
 
     def on_thumb_click(self, item):
+        if self.current_kind == K_PDF:
+            self.show_pdf_page(item.data(Qt.UserRole))
+            return
         sec = item.data(Qt.UserRole)
         if sec is not None:
             self.player.setPosition(int(sec * 1000))

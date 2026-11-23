@@ -1,7 +1,7 @@
 @echo off
 rem ===== ShiwakeFiler build script (run once on your PC) =====
 cd /d %~dp0
-python -m pip install --upgrade pyinstaller PySide6 av send2trash
+python -m pip install --upgrade pyinstaller PySide6 av send2trash pillow
 if errorlevel 1 goto err
 python -m PyInstaller --noconfirm --clean --windowed --name ShiwakeFiler --collect-all av shiwake_filer.py
 if errorlevel 1 goto err
